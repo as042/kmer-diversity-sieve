@@ -111,6 +111,46 @@ static void test_minhash_jaccard(void) {
 
 /* ================= binomial-ish sanity: warmup outlier math is elsewhere ================= */
 
+/* ================= promoted-set band index (growth) ================= */
+/* The index is open-addressed and both probe loops stop only at an empty slot, so a full
+ * table makes the next lookup of an absent key spin forever. It must therefore grow. Start
+ * from a 4-slot table and insert far more keys than it holds: every key must still be found,
+ * an absent key must still return NULL (rather than hang), and the id lists must survive
+ * the rehash intact. Against the unpatched code this test does not fail, it hangs. */
+static void test_pset_band_index_grows(void) {
+    enum { N = 1000 };
+    pset_t p;
+    pset_init(&p, 8, 2);                       /* 4 buckets, deliberately tiny */
+    CHECK(p.nbuk == 4, "pset_init honours log2buk (got %llu)", (unsigned long long)p.nbuk);
+
+    for (int i = 0; i < N; i++) bucket_add(&p, (uint64_t)i * 0x9E3779B97F4A7C15ULL, i);
+
+    CHECK(p.nbuk >= 2 * N, "table grew to hold %d keys at <=1/2 load (nbuk=%llu)",
+          N, (unsigned long long)p.nbuk);
+    CHECK(p.nused == N, "every distinct key took a slot (nused=%llu)",
+          (unsigned long long)p.nused);
+
+    int found = 0, right_id = 0;
+    for (int i = 0; i < N; i++) {
+        bucket_t *b = bucket_find(&p, (uint64_t)i * 0x9E3779B97F4A7C15ULL);
+        if (b) { found++; if (b->n == 1 && b->ids[0] == i) right_id++; }
+    }
+    CHECK(found == N, "every key is still findable after the rehash (%d of %d)", found, N);
+    CHECK(right_id == N, "each bucket kept its own id list (%d of %d)", right_id, N);
+
+    /* The whole point: an absent key terminates instead of spinning. */
+    CHECK(bucket_find(&p, 0xDEADBEEFCAFEF00DULL) == NULL, "an absent key returns NULL");
+
+    /* Repeated keys share one bucket and do not consume extra slots. */
+    uint64_t before = p.nused;
+    bucket_add(&p, 0x9E3779B97F4A7C15ULL, 4242);          /* same key as i == 1 */
+    CHECK(p.nused == before, "a repeated key takes no new slot");
+    bucket_t *b = bucket_find(&p, 0x9E3779B97F4A7C15ULL);
+    CHECK(b && b->n == 2 && b->ids[1] == 4242, "a repeated key appends to its id list");
+
+    pset_free(&p);
+}
+
 int main(void) {
     init_lut();
     test_genome_kmers();
@@ -118,6 +158,7 @@ int main(void) {
     test_month_bucket();
     test_cms();
     test_minhash_jaccard();
+    test_pset_band_index_grows();
 
     fprintf(stderr, "\nunit_test: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

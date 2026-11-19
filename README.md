@@ -142,13 +142,26 @@ which byte-range of the input and how the per-shard promoted sets are merged.*
 | `--k` | 15 | k-mer size |
 | `--sketch` | 64 | MinHash sketch size (m); LSH = 16 bands × (m/16) rows |
 | `--threshold` | 0.15 | novelty promotion threshold (τ) |
-| `--outlier-sd` | 5.0 | admission singleton-outlier SD threshold |
-| `--warmup` | 2000 | records to warm the Count-Min sketch before deciding |
+| `--outlier-sd` | 5.0 | admission singleton-outlier SD threshold (only with `--warmup`) |
+| `--warmup` | off | records to warm the Count-Min sketch before admission starts; **admission is off unless this is set** |
 | `--limit` | 0 (all) | cap records (smoke tests) |
 | `--threads` | online CPUs | **threads backend only:** number of pthreads (each owns a byte-range) |
 
 The `27000` / `0.05` defaults are sized for coronavirus-length genomes —
 **override `--min-len` and `--max-n-frac` for any other organism.**
+
+### Admission is off by default
+
+With `--warmup N`, records after the first `N` are checked against a running band of
+`mean + --outlier-sd x sd` over the per-record count of never-seen k-mers, and a record above
+it is rejected. A rejected record is never sketched, promoted, or added to the k-mer table, so
+the rest of its clade tends to be rejected with it.
+
+Where that band sits is a property of the **file**, not of the biology: the first record
+contributes tens of times as many never-seen k-mers as a later one, so there is no divergence
+a caller can stay under, and which lineages survive depends on their order in the input.
+Measured on a 2,100-record cohort followed by a 3% divergent lineage, the whole lineage was
+rejected; the same lineage placed first was kept. It is therefore off unless asked for.
 
 ## Calibrating `--threshold` and `--sketch`
 
@@ -202,7 +215,7 @@ mash dist -k 15 -s 1000 recon.fasta recon.fasta | awk '{print $3}' | sort -n
 ```
 
 *(This calibration was worked out in the [`disassembler`](https://github.com/nekrut/disassembler)
-integration — see its `docs/issue_sieve_calibration.md` for cross-gene topology
+integration — see its `docs/notes/sieve_calibration.md` for cross-gene topology
 measurements. Its `disassemble.py` wrapper defaults to `τ = 0.005`, `m = 256` for
 gene-scale cohorts, versus this tool's archive-scale `τ = 0.15`, `m = 64`.)*
 

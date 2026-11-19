@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>          /* INT_MAX: the "admission off" warmup sentinel */
 #include <math.h>
 #include <ctype.h>
 #include <sys/types.h>
@@ -71,7 +72,17 @@ static inline double L1_WTIME(void){ struct timespec ts; clock_gettime(CLOCK_MON
 /* ---- admission config (match l1_trigger.c / oracle) ---- */
 #define DEF_K            15
 #define DEF_OUTLIER_SD   5.0
-#define DEF_WARMUP       2000
+/* Admission is OFF unless --warmup asks for it. The gate rejects a record whose count of
+ * never-seen k-mers is a statistical outlier, and a rejected record is never sketched,
+ * promoted or added to the k-mer table, so the rest of its clade goes with it. The band is
+ * mean + outlier_sd*sd over the running singleton counts, and the first record contributes
+ * tens of times what a later one does, so where the band sits is a property of the FILE
+ * rather than of the biology: there is no divergence a caller can stay under, and which
+ * lineages survive depends on their order in the input. Measured on a 2,100-record cohort,
+ * a lineage 3% divergent placed after the ramp was dropped and the same lineage placed
+ * first was kept. Pass --warmup N to arm it deliberately. */
+#define WARMUP_OFF       INT_MAX
+#define DEF_WARMUP       WARMUP_OFF
 #define CMS_LOG2W        22   /* 2^22 x 4 rows x 4B = 64 MB/shard (was 2^24=256MB; caused node OOM at 128 ranks/node) */
 #define CMS_D            4
 /* ---- novelty config (match l1_novelty.c) ---- */
@@ -133,11 +144,12 @@ static double n_fraction(const uint8_t*s,size_t l){if(l==0)return 1.0;size_t a=0
 
 /* ---- novelty promoted-set + LSH band index (from l1_novelty.c) ---- */
 typedef struct { uint64_t key; int *ids; int n,cap; } bucket_t;
-typedef struct { uint64_t*sk; int n,cap,m; bucket_t*buk; uint64_t nbuk,mask;
+typedef struct { uint64_t*sk; int n,cap,m; bucket_t*buk; uint64_t nbuk,mask,nused;
                  char**hdrs; } pset_t;    /* hdrs: promoted headers (for --emit) */
 static void pset_init(pset_t*p,int m,uint64_t log2buk){ p->m=m;p->n=0;p->cap=1024;
     p->sk=malloc((size_t)p->cap*m*sizeof(uint64_t)); p->hdrs=malloc(p->cap*sizeof(char*));
-    p->nbuk=(uint64_t)1<<log2buk; p->mask=p->nbuk-1; p->buk=calloc(p->nbuk,sizeof(bucket_t)); }
+    p->nbuk=(uint64_t)1<<log2buk; p->mask=p->nbuk-1; p->nused=0;
+    p->buk=calloc(p->nbuk,sizeof(bucket_t)); }
 /* Date-partitioned novelty: fold the sample's month bucket into the LSH
  * band key so novelty is judged WITHIN a date window. A genome only ever compares against
  * promoted genomes from the SAME month, so undersampled months keep their own tau-diverse
@@ -147,9 +159,27 @@ static inline uint64_t band_key(int mbucket,int band,const uint64_t*sk,int R){
     uint64_t h=0x9E3779B97F4A7C15ULL^((uint64_t)band*0xC2B2AE3D27D4EB4FULL);
     h^=(uint64_t)(mbucket+1)*0x94D049BB133111EBULL; h*=0x100000001B3ULL; h^=h>>33;  /* date in signature */
     for(int r=0;r<R;r++){h^=sk[band*R+r];h*=0x100000001B3ULL;h^=h>>33;} return h; }
+/* Double the band index and rehash into it. A bucket moves whole, id list and all, so
+ * nothing it owns is reallocated and no membership changes: only the slot a key sits in. */
+static void pset_grow(pset_t*p){ uint64_t nn=p->nbuk*2,nmask=nn-1;
+    bucket_t*nb=calloc(nn,sizeof(bucket_t));
+    if(!nb){fprintf(stderr,"band index grow fail (%llu buckets)\n",(unsigned long long)nn);L1_ABORT();}
+    for(uint64_t b=0;b<p->nbuk;b++){ if(!p->buk[b].ids)continue;
+        uint64_t k=p->buk[b].key,i=(k^(k>>29))&nmask;
+        while(nb[i].ids)i=(i+1)&nmask; nb[i]=p->buk[b]; }
+    free(p->buk); p->buk=nb; p->nbuk=nn; p->mask=nmask; }
+/* Both probe loops here and in bucket_find stop only at an EMPTY slot, so the table must
+ * never fill: keep it at most half occupied. Without this it holds 2^20 band keys, which is
+ * 65,536 promoted genomes at 16 bands each, and the next lookup of an absent key spins
+ * forever at 100% CPU with nothing printed. */
 static void bucket_add(pset_t*p,uint64_t key,int id){ uint64_t idx=(key^(key>>29))&p->mask;
-    while(p->buk[idx].ids&&p->buk[idx].key!=key)idx=(idx+1)&p->mask; bucket_t*b=&p->buk[idx];
-    if(!b->ids){b->key=key;b->cap=4;b->ids=malloc(b->cap*sizeof(int));b->n=0;}
+    while(p->buk[idx].ids&&p->buk[idx].key!=key)idx=(idx+1)&p->mask;
+    if(!p->buk[idx].ids){                                  /* a key this set has not seen */
+        if(2*(p->nused+1)>p->nbuk){ pset_grow(p); idx=(key^(key>>29))&p->mask;
+            while(p->buk[idx].ids&&p->buk[idx].key!=key)idx=(idx+1)&p->mask; }
+        bucket_t*nbk=&p->buk[idx];
+        nbk->key=key;nbk->cap=4;nbk->ids=malloc(nbk->cap*sizeof(int));nbk->n=0; p->nused++; }
+    bucket_t*b=&p->buk[idx];
     if(b->n==b->cap){b->cap*=2;b->ids=realloc(b->ids,b->cap*sizeof(int));} b->ids[b->n++]=id; }
 static bucket_t* bucket_find(pset_t*p,uint64_t key){ uint64_t idx=(key^(key>>29))&p->mask;
     while(p->buk[idx].ids){if(p->buk[idx].key==key)return &p->buk[idx];idx=(idx+1)&p->mask;} return NULL; }
@@ -176,7 +206,7 @@ static void pset_free(pset_t*p){
     free(p->sk); p->sk=NULL;
     for(uint64_t b=0;b<p->nbuk;b++) free(p->buk[b].ids);
     free(p->buk); p->buk=NULL;
-    p->n=p->cap=0;
+    p->n=p->cap=0; p->nused=0;
 }
 /* parse month bucket (year*12+month0) from a GISAID header: field 2 of '|' split = YYYY-MM-DD.
  * returns -1 if undated/unparseable (all such genomes share one bucket). */
@@ -201,12 +231,19 @@ static int month_bucket(const char*hdr){
     /* COMPLETENESS GATE (§2.22): drop partial/gappy genomes BEFORE novelty can promote them for \
      * being k-mer-sparse. Cheap length + N-fraction check, before k-mer extraction. */ \
     if((long)seqlen<min_len || n_fraction(seq,seqlen)>max_n_frac){ n_lowqual++; } else { \
+    /* The sequence buffer grows but this one used not to, so k-mers past ~65,550 were \
+     * dropped silently: two records identical over that prefix then looked like \
+     * near-duplicates whatever followed, and one was discarded at exit 0. A record of \
+     * length L yields at most L k-mers, so L entries always suffice. */ \
+    if(seqlen>kcap){ kcap=seqlen; kbuf=realloc(kbuf,kcap*sizeof(uint64_t)); \
+        if(!kbuf){fprintf(stderr,"k-mer buffer alloc fail (%zu entries)\n",kcap);L1_ABORT();} } \
     size_t nu=genome_kmers(seq,seqlen,k,kbuf,kcap); \
     if(nu==0){ n_skip++; } else { \
         /* ADMISSION */ \
         long n_singleton=0; for(size_t z=0;z<nu;z++){uint32_t d=cms_query(&cms,kbuf[z]);if(d==0)n_singleton++;} \
         int reject=0; \
-        if(sc_n>=warmup && n_mine>warmup){ double mean=sc_sum/sc_n,var=sc_sqsum/sc_n-mean*mean; if(var<0)var=0; \
+        if(warmup!=WARMUP_OFF && sc_n>=warmup && n_mine>warmup){ \
+            double mean=sc_sum/sc_n,var=sc_sqsum/sc_n-mean*mean; if(var<0)var=0; \
             if((double)n_singleton>mean+outlier_sd*sqrt(var)+0.5) reject=1; } \
         sc_sum+=n_singleton; sc_sqsum+=(double)n_singleton*n_singleton; sc_n++; \
         if(reject){ n_reject++; } else { n_admit++; \
